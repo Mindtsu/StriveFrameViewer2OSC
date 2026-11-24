@@ -143,7 +143,7 @@ class ModeWatcher {
 
 public:
   // Returns true when the current game mode is listed in "modes".
-  bool check() {
+  bool is_mode_allowed() {
     if (!game_common_) {
       game_common_ = reinterpret_cast<UREDGameCommon *>(UObjectGlobals::FindFirstOf(FName(STR("REDGameCommon"))));
     }
@@ -168,7 +168,7 @@ void hook_MatchStart(AREDGameState_Battle *game_state) {
 }
 
 void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
-  if (!g_mode.check() || !g_reporter) {
+  if (!g_mode.is_mode_allowed() || !g_reporter) {
     orig_UpdateBattle(game_state, delta_time);
     return;
   }
