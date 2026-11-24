@@ -151,6 +151,12 @@ public:
   static asw_engine *get();
 
   ARRAY_FIELD(0x0, player_block[2], players);
+  // Gauges, offsets taken from StriveLabs (ENVYFGC/StriveLabs, include/game/arcsys.h).
+  // Tension: 0..10000 (divide by 100 for %). Burst: 0..15000 (divide by 150 for %).
+  FIELD(0x60, int, P1Tension);
+  FIELD(0x1F8, int, P2Tension);
+  FIELD(0x14C8, int, P1BurstRaw);
+  FIELD(0x14CC, int, P2BurstRaw);
   FIELD(0x910, int, entity_count);
   ARRAY_FIELD(0xC80, class asw_entity* [107], entities);
   ARRAY_FIELD(0x3868, asw_inputs[6], inputs);
@@ -369,6 +375,7 @@ public:
   FIELD(0x1140, atk_param_ex, atk_param_ex_defend); // Outdated?
   FIELD(0x1218, int, throw_invuln_time);
   FIELD(0x1220, int, strike_invuln_time);
+  FIELD(0x1254, int, hp); // current health, from StriveLabs (replay_manager.cpp)
   // bbscript
   FIELD(0x1288, bbscript::event_bitmask, event_handler_bitmask);
   FIELD(0x12D8, char*, bbs_file);

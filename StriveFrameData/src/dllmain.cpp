@@ -1,15 +1,27 @@
+// StriveOSC: sends what happens in a Guilty Gear -Strive- battle as OSC
+// messages on the local machine (moves interpreted by the game, health,
+// tension, burst, R.I.S.C., rounds).
+//
+// Based on StriveFrameViewer (pbozai, Sevoi, Procdox). The analysis tools
+// (frame bar, hitboxes, pause, menu) were removed: this mod draws nothing.
+
 #include <polyhook2/Detour/x64Detour.hpp>
 
 #include "arcsys.h"
-#include "bind_watcher.h"
-#include "draw_utils.h"
-#include "framebar.h"
-#include "hitboxes.h"
-#include "menu.h"
+#include "game_reader.h"
+#include "game_reporter.h"
+#include "osc_config.h"
+#include "osc_sender.h"
+#include "risc_finder.h"
 #include "sigscan.h"
-#include <chrono>
-#include <thread>
-using namespace std::chrono_literals;
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <sstream>
+#include <string>
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Mod/CppUserModBase.hpp>
@@ -20,30 +32,20 @@ using namespace std::chrono_literals;
 #define WIN32_LEAN_AND_MEAN
 #include "Windows.h"
 
-#define STRIVEFRAMEDATA_API __declspec(dllexport)
+#define STRIVEOSC_API __declspec(dllexport)
 
 /* Definitions */
 
-// Classes
 class UREDGameCommon : public Unreal::UObject {};
 
-// Functions
-using funcAHUDPostRender_t = void (*)(void *);
-using funcACamUpdateCamera_t = void (*)(void *, float);
 using funcMatchStart_t = void (*)(AREDGameState_Battle *);
 using funcGetGameMode_t = int (*)(UREDGameCommon *);
 using funcUpdateBattle_t = void (*)(AREDGameState_Battle *, float);
 
-// Other func
-using funcGetWorldSettings = Unreal::UObject* (*)(void *);
-
-// Hooks
-void hook_AHUDPostRender(void *);
-void hook_ACamUpdateCamera(void *, float);
 void hook_MatchStart(AREDGameState_Battle *);
 void hook_UpdateBattle(AREDGameState_Battle *, float);
 
-// Enums
+// For reference, the values used in osc_config.ini "modes".
 enum GAME_MODE : int32_t {
   GAME_MODE_DEBUG_BATTLE = 0x0,
   GAME_MODE_ADVERTISE = 0x1,
@@ -77,356 +79,149 @@ enum GAME_MODE : int32_t {
 
 /* Utilities */
 
-const void *vtable_hook(const void **vtable, const int index, const void *hook) {
-  DWORD old_protect;
-  VirtualProtect(&vtable[index], sizeof(void *), PAGE_READWRITE, &old_protect);
-  const auto *orig = vtable[index];
-  vtable[index] = hook;
-  VirtualProtect(&vtable[index], sizeof(void *), old_protect, &old_protect);
-  return orig;
-}
+namespace {
+  std::wstring to_wide(const std::string &text) {
+    if (text.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size);
+    return result;
+  }
 
-/* Variables */
+  void log_line(const std::string &text) {
+    RC::Output::send<LogLevel::Verbose>(STR("[StriveOSC] {}\n"), to_wide(text));
+  }
 
-// Functions
-funcGetGameMode_t orig_GetGameMode;
-funcAHUDPostRender_t orig_AHUDPostRender;
-funcACamUpdateCamera_t orig_ACamUpdateCamera;
-funcMatchStart_t orig_MatchStart;
-funcUpdateBattle_t orig_UpdateBattle;
+  void log_warning(const std::string &text) {
+    RC::Output::send<LogLevel::Warning>(STR("[StriveOSC] {}\n"), to_wide(text));
+  }
 
-// State Data
-UE4SSProgram *Program;
+  // <game>/.../Mods/StriveOSC/dlls/main.dll -> <game>/.../Mods/StriveOSC/osc_config.ini
+  std::filesystem::path config_path() {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&config_path), &module);
+    wchar_t buffer[MAX_PATH * 2] = {};
+    GetModuleFileNameW(module, buffer, static_cast<DWORD>(std::size(buffer)));
+    return std::filesystem::path(buffer).parent_path().parent_path() / L"osc_config.ini";
+  }
 
-// Trackers
-class StateMgr {
-  UREDGameCommon *GameCommon = nullptr;
-  int last_mode = GAME_MODE_DEBUG_BATTLE;
-  bool in_allowed_mode = false;
-  std::vector<int> allowed_modes = {GAME_MODE_TRAINING, GAME_MODE_REPLAY, GAME_MODE_MISSION, GAME_MODE_UNDECIDED};
+  OscConfig load_config() {
+    OscConfig config;
+    const auto path = config_path();
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+      std::ofstream created(path, std::ios::binary);
+      if (created) created << OscConfig::default_file_contents();
+      log_line("no osc_config.ini found next to the dlls folder, created one with the default settings");
+      return config;
+    }
+    std::stringstream text;
+    text << file.rdbuf();
+    std::vector<std::string> warnings;
+    config.load_from_text(text.str(), warnings);
+    for (const auto &warning : warnings) log_warning("osc_config.ini " + warning);
+    return config;
+  }
+} // namespace
+
+/* State */
+
+funcGetGameMode_t orig_GetGameMode = nullptr;
+funcMatchStart_t orig_MatchStart = nullptr;
+funcUpdateBattle_t orig_UpdateBattle = nullptr;
+
+OscConfig g_config;
+OscSender g_sender;
+std::unique_ptr<GameReporter> g_reporter;
+std::unique_ptr<RiscFinder> g_risc_finder;
+
+class ModeWatcher {
+  UREDGameCommon *game_common_ = nullptr;
+  int last_mode_ = -1;
+  bool allowed_ = false;
 
 public:
-  bool checkMode() {
-    if (!GameCommon) {
-      GameCommon = reinterpret_cast<UREDGameCommon *>(UObjectGlobals::FindFirstOf(FName(STR("REDGameCommon"))));
+  // Returns true when the current game mode is listed in "modes".
+  bool check() {
+    if (!game_common_) {
+      game_common_ = reinterpret_cast<UREDGameCommon *>(UObjectGlobals::FindFirstOf(FName(STR("REDGameCommon"))));
     }
-    if (!GameCommon) return false;
-    if (int current_mode = orig_GetGameMode(GameCommon); current_mode != last_mode) {
-      //       RC::Output::send<LogLevel::Warning>(STR("Mode Change: {}\n"), current_mode);
-      last_mode = current_mode;
-      in_allowed_mode = (std::find(allowed_modes.begin(), allowed_modes.end(), current_mode) != allowed_modes.end());
+    if (!game_common_ || !orig_GetGameMode) return false;
+
+    const int mode = orig_GetGameMode(game_common_);
+    if (mode != last_mode_) {
+      last_mode_ = mode;
+      allowed_ = std::find(g_config.modes.begin(), g_config.modes.end(), mode) != g_config.modes.end();
+      log_line("game mode " + std::to_string(mode) + (allowed_ ? ": OSC active" : ": OSC inactive"));
+      if (allowed_) g_sender.send(OscMessage(g_config.prefix + "/mode").add(static_cast<int32_t>(mode)));
     }
-    return in_allowed_mode;
+    return allowed_;
   }
-  void checkRound() {
-    resetting = false;
-    auto *events = asw_events::get();
-    auto count = events->event_count;
-    if (count > 10) count = 10;
-    for (unsigned int idx = 0; idx < count; ++idx) {
-      auto e_type = events->events[idx].type;
-      // if(e_type < 41) RC::Output::send<LogLevel::Warning>(STR("Event {}: {}\n"), idx, (int)e_type);
-      if (e_type == BOM_EVENT_RESET || e_type == BOM_EVENT_DECISION) {
-        resetting = true;
-        roundActive = false;
-      }
-      if (e_type == BOM_EVENT_BATTLE_START) {
-        resetting = true;
-        roundActive = true;
-      };
-    }
-  }
-
-  bool resetting = false;
-  bool matchStarted = true;
-  bool roundActive = false;
-
-} game_state;
-
-class Keybinds {
-public:
-  static const int BUTTON_COUNT = 9;
-
-  int TOGGLE_FRAMEBAR_BUTTON = VK_F1;
-  int TOGGLE_HITBOX_BUTTON = VK_F2;
-  int PAUSE_BUTTON = VK_F3;
-  int ADVANCE_BUTTON = VK_F4;
-  int TOGGLE_MENU_BUTTON = VK_F5;
-
-  int MENU_UP_BUTTON = VK_UP;
-  int MENU_DOWN_BUTTON = VK_DOWN;
-  int MENU_LEFT_BUTTON = VK_LEFT;
-  int MENU_RIGHT_BUTTON = VK_RIGHT;
-
-  int buttons[BUTTON_COUNT] = {TOGGLE_FRAMEBAR_BUTTON, TOGGLE_HITBOX_BUTTON, PAUSE_BUTTON, ADVANCE_BUTTON, TOGGLE_MENU_BUTTON, MENU_UP_BUTTON, MENU_DOWN_BUTTON, MENU_LEFT_BUTTON, MENU_RIGHT_BUTTON};
-
-  int getButtonIndex(int input) {
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      if (buttons[i] == input) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
-  bool setButtonState(int input, bool val) {
-    int index = getButtonIndex(input);
-    if (index != -1) {
-      buttonStates[index] = val;
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  bool getButtonState(int input) {
-    int index = getButtonIndex(input);
-    if (index != -1) {
-      return buttonStates[index];
-    }
-    return false;
-  }
-
-  void resetButton(int input) {
-    int index = getButtonIndex(input);
-    if (index != -1) {
-      buttonStates[index] = false;
-    }
-  }
-
-  void resetButtons() {
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      buttonStates[i] = false;
-    }
-  }
-
-  void loadButtons() {
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      BindWatcherI::addToFilter(buttons[i]);
-    }
-  }
-
-  void checkBinds(bool await = false) {
-    auto inputs = BindWatcherI::getInputs(await);
-    for (const auto &input : inputs) {
-      setButtonState(input, true);
-    }
-  }
-
-private:
-  bool buttonStates[BUTTON_COUNT] = {};
-} keybindings;
-
-class PauseManager {
-  bool isPaused = false;
-  bool shouldAdvance = false;
-
-public:
-  bool advancing() const {
-    return isPaused && shouldAdvance;
-  }
-
-  bool cinematicShouldAdvance() {
-    return isPaused && !shouldAdvance;
-  }
-
-  void updateBinds() {
-    if (keybindings.getButtonState(keybindings.PAUSE_BUTTON)) {
-      keybindings.resetButton(keybindings.PAUSE_BUTTON);
-      isPaused = !isPaused;
-    }
-
-    if (keybindings.getButtonState(keybindings.ADVANCE_BUTTON)) {
-      keybindings.resetButton(keybindings.ADVANCE_BUTTON);
-      shouldAdvance = true;
-    }
-  }
-
-  void checkPause() {
-    if (advancing()) {
-      shouldAdvance = false;
-      return;
-    }
-
-    updateBinds();
-
-    if (ModMenu::instance().pauseType() == 0) {
-      while (isPaused && !shouldAdvance) {
-        keybindings.checkBinds(true);
-        updateBinds();
-      }
-    }
-  }
-
-  void reset() {
-    isPaused = false;
-    shouldAdvance = false;
-  }
-} pause_manager;
-
-class UeTracker {
-  Unreal::UObject *worldsets_actor = nullptr;
-  Unreal::FProperty *paused_prop = nullptr;
-  bool renderingHooked = false;
-
-  void hookFuncs() {
-    if (renderingHooked) return;
-    renderingHooked = true;
-
-    /* HUD Rendering vtable hook*/
-    const auto **AHUD_vtable = (const void **)get_rip_relative(sigscan::get().scan("\x48\x8D\x05\x00\x00\x00\x00\xC6\x83\x18\x03", "xxx????xxxx") + 3);
-    orig_AHUDPostRender = (funcAHUDPostRender_t)vtable_hook(AHUD_vtable, 214, hook_AHUDPostRender);
-
-    const auto **ACamera_vtable = (const void **)get_rip_relative(sigscan::get().scan("\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x07\x48\x8D\x8F\x00\x00\x00\x00\xC7\x87\x00\x00\x00\x00\xFF\xFF\xFF\xFF", "xxx????xxxxxx????xx????xxxx") + 3);
-
-    orig_ACamUpdateCamera = (funcACamUpdateCamera_t)vtable_hook(ACamera_vtable, 208, hook_ACamUpdateCamera);
-  }
-  void findProp() {
-    // static auto input_class_name = Unreal::FName(STR("REDPlayerController_Battle"), Unreal::FNAME_Add);
-    static auto getworldsets_func_name = Unreal::FName(STR("K2_GetWorldSettings"), Unreal::FNAME_Add);
-
-    // auto *input_actor = static_cast<Unreal::AActor *>(UObjectGlobals::FindFirstOf(input_class_name));
-    // if (!input_actor) return;
-
-    // auto *world_actor = input_actor->GetWorld();
-    // if (!world_actor) return;
-
-    auto world_actor = reinterpret_cast<Unreal::UObject *>(GWorld);
-
-    auto *getworldsets_func = world_actor->GetFunctionByNameInChain(getworldsets_func_name);
-    if (!getworldsets_func) return;
-
-    world_actor->ProcessEvent(getworldsets_func, &worldsets_actor);
-    if (!worldsets_actor) return;
-
-    paused_prop = worldsets_actor->GetPropertyByName(STR("PauserPlayerState"));
-  }
-
-public:
-  void reset() {
-    worldsets_actor = nullptr;
-    paused_prop = nullptr;
-  }
-  void setup() {
-    reset();
-    hookFuncs();
-    findProp();
-  }
-  bool isUePaused() {
-    if (!paused_prop) return false;
-    Unreal::AActor **val = static_cast<Unreal::AActor **>(paused_prop->ContainerPtrToValuePtr<void>(worldsets_actor));
-    return (bool)val ? ((bool)*val) : false;
-  }
-} tracker;
+} g_mode;
 
 /* Hooks */
 
-FrameBar the_bar;
-
-void hook_MatchStart(AREDGameState_Battle *GameState) {
-  game_state.matchStarted = true;
-  game_state.roundActive = false;
-  pause_manager.reset();
-  tracker.reset();
-
-  DrawTool::instance().matchStart();
-
-  orig_MatchStart(GameState);
+void hook_MatchStart(AREDGameState_Battle *game_state) {
+  if (g_reporter) g_reporter->on_match_start();
+  orig_MatchStart(game_state);
 }
-void hook_AHUDPostRender(void *hud) {
-  if (!game_state.checkMode()) {
-    orig_AHUDPostRender(hud);
+
+void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
+  if (!g_mode.check() || !g_reporter) {
+    orig_UpdateBattle(game_state, delta_time);
     return;
   }
 
-  if (DrawTool::instance().update(hud)) {
-    auto &menu = ModMenu::instance();
-    menu.draw();
-    if (menu.hitboxEnabled()) drawAllBoxes();
-    if (menu.barEnabled()) the_bar.draw();
-  }
+  const BattleEvents events = read_battle_events();
+  orig_UpdateBattle(game_state, delta_time);
 
-  if (pause_manager.advancing()) return;
-  orig_AHUDPostRender(hud);
-}
-void hook_ACamUpdateCamera(void *cam, float DeltaTime) {
-  if (!game_state.checkMode()) {
-    orig_ACamUpdateCamera(cam, DeltaTime);
-    return;
-  }
+  // Online rollback replays frames; never report them twice.
+  if (is_resimulating()) return;
 
-  if (pause_manager.advancing()) return;
-  orig_ACamUpdateCamera(cam, DeltaTime);
-}
-void hook_UpdateBattle(AREDGameState_Battle *GameState, float DeltaTime) {
-  if (!game_state.checkMode()) {
-    orig_UpdateBattle(GameState, DeltaTime);
-    return;
-  }
+  FrameSnapshot frame;
+  if (read_frame(g_config, events, frame)) g_reporter->on_frame(frame);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(ModMenu::instance().delayAmount()));
-
-  keybindings.checkBinds(false);
-  pause_manager.checkPause();
-
-  if (ModMenu::instance().pauseType() == 0 && pause_manager.advancing()) return;
-  if (ModMenu::instance().pauseType() == 1 && pause_manager.cinematicShouldAdvance()) return;
-
-  ModMenu::instance().update(PressedKeys{
-      keybindings.getButtonState(keybindings.TOGGLE_FRAMEBAR_BUTTON),
-      keybindings.getButtonState(keybindings.TOGGLE_HITBOX_BUTTON),
-      keybindings.getButtonState(keybindings.TOGGLE_MENU_BUTTON),
-      keybindings.getButtonState(keybindings.MENU_UP_BUTTON),
-      keybindings.getButtonState(keybindings.MENU_DOWN_BUTTON),
-      keybindings.getButtonState(keybindings.MENU_RIGHT_BUTTON),
-      keybindings.getButtonState(keybindings.MENU_LEFT_BUTTON)});
-  keybindings.resetButtons();
-
-  game_state.checkRound();
-  if (game_state.resetting) {
-    the_bar.reset();
-  }
-
-  orig_UpdateBattle(GameState, DeltaTime);
-
-  if (game_state.matchStarted) {
-    game_state.matchStarted = false;
-    // DrawTool::instance().initialize();
-    tracker.setup();
-  }
-
-  if (!tracker.isUePaused() && game_state.roundActive) {
-    the_bar.addFrame();
-  }
+  if (g_risc_finder) g_risc_finder->poll();
 }
 
 /* Mod Definition */
-class StriveFrameData : public CppUserModBase {
+
+class StriveOSC : public CppUserModBase {
 public:
-  PLH::x64Detour *UpdateBattle_Detour;
-  PLH::x64Detour *MatchStart_Detour;
+  PLH::x64Detour *UpdateBattle_Detour = nullptr;
+  PLH::x64Detour *MatchStart_Detour = nullptr;
 
-  StriveFrameData()
-  : CppUserModBase() {
-    ModName = STR("Strive Frame Data");
-    ModVersion = STR("1.04");
-    ModDescription = STR("A tool to display frame advantage.");
-    ModAuthors = STR("pbozai, Sevoi");
-    UpdateBattle_Detour = nullptr;
-    MatchStart_Detour = nullptr;
-    // Do not change this unless you want to target a UE4SS version
-    // other than the one you're currently building with somehow.
-    // ModIntendedSDKVersion = STR("2.6");
-
-    Output::send<LogLevel::Verbose>(STR("Strive Frame Viewer Started\n"));
+  StriveOSC() : CppUserModBase() {
+    ModName = STR("StriveOSC");
+    ModVersion = STR("0.1");
+    ModDescription = STR("Sends battle events (moves, health, tension, burst) as OSC on the local machine.");
+    ModAuthors = STR("Mindtsu; based on StriveFrameViewer by pbozai, Sevoi, Procdox");
+    Output::send<LogLevel::Verbose>(STR("StriveOSC started\n"));
   }
 
-  ~StriveFrameData() override {}
+  ~StriveOSC() override {}
 
   auto on_update() -> void override {}
 
   auto on_unreal_init() -> void override {
-    Program = &UE4SSProgram::get_program();
+    g_config = load_config();
+
+    std::string error;
+    if (!g_sender.open(g_config.host, g_config.port, error)) {
+      log_warning("OSC disabled: " + error);
+    } else {
+      log_line("sending OSC to " + g_config.host + ":" + std::to_string(g_config.port) + " with prefix " + g_config.prefix);
+    }
+
+    g_reporter = std::make_unique<GameReporter>(
+        g_config, [](const OscMessage &message) { g_sender.send(message); }, log_line);
+
+    if (g_config.risc_finder) {
+      g_risc_finder = std::make_unique<RiscFinder>(log_warning);
+      log_warning("RISC finder enabled (F6 start, F7 went up, F8 went down).");
+    }
+    log_line("RISC p1 = " + g_config.risc_p1.to_string() + ", p2 = " + g_config.risc_p2.to_string());
 
     const uint64_t UpdateBattle_Addr = sigscan::get().scan("\x40\x53\x57\x41\x54\x41\x55\x48\x81\xEC\x88\x00\x00\x00", "xxxxxxxxxxxxxx");
     UpdateBattle_Detour = new PLH::x64Detour(UpdateBattle_Addr, reinterpret_cast<uint64_t>(&hook_UpdateBattle), reinterpret_cast<uint64_t *>(&orig_UpdateBattle));
@@ -441,17 +236,15 @@ public:
     orig_GetGameMode = reinterpret_cast<funcGetGameMode_t>(GetGameMode_Addr);
 
     ASWInitFunctions();
-    //    bbscript::BBSInitializeFunctions();
-    keybindings.loadButtons();
   }
 };
 
 extern "C" {
-STRIVEFRAMEDATA_API CppUserModBase *start_mod() {
-  return new StriveFrameData();
+STRIVEOSC_API CppUserModBase *start_mod() {
+  return new StriveOSC();
 }
 
-STRIVEFRAMEDATA_API void uninstall_mod(CppUserModBase *mod) {
+STRIVEOSC_API void uninstall_mod(CppUserModBase *mod) {
   delete mod;
 }
 }

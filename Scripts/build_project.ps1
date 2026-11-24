@@ -33,7 +33,8 @@ function Build {
 }
 
 $Version = $PSVersionTable.PSVersion
-if(($Version -lt 7) -or ($Version.Minor -lt 4) -or ($Version.Patch -lt 1)){
+# Proper version comparison (the old per-field check rejected e.g. 7.5.0)
+if($Version -lt [System.Management.Automation.SemanticVersion]::new(7, 4, 1)){
   Write-Host "Build Script requires powershell version 7.4.1 or newer.`nCurrent version: $Version"
   Exit 1
 }

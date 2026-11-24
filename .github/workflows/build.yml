@@ -1,75 +1,57 @@
-name: MSVC Build
-on: workflow_dispatch
+name: Build StriveOSC
+
+# Runs on every push to master, or by hand from the Actions tab.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
 
 env:
   BUILD_CONFIGURATION: Game__Shipping__Win64
 
 permissions:
-  contents: write
-  id-token: write
-  issues: write
+  contents: read
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pinned image with Visual Studio 2022 (the CMake generator below needs it).
+    runs-on: windows-2025
     steps:
-    - name: Setup github SSH
+    # UE4SS depends on a private repository (Re-UE4SS/UEPseudo) that only
+    # GitHub accounts linked to Epic Games can read. The secret holds the
+    # private SSH key of such an account (see README).
+    - name: Setup GitHub SSH
       uses: shimataro/ssh-key-action@v2
       with:
         key: ${{ secrets.UEPSEUDO_SSH_KEY }}
         known_hosts: unnecessary
 
-    - name: Checkout SFV
-      uses: actions/checkout@v3
-      with:
-        submodules: recursive
-        fetch-depth: 0 # needed to get commits since last tag
-        ssh-key: ${{ secrets.UEPSEUDO_SSH_KEY }}
-    
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # The submodule URL of UEPseudo is https: route it through SSH so the
+    # key above is used, then fetch every submodule.
+    - name: Fetch submodules
+      shell: pwsh
+      run: |
+        git config --global url."git@github.com:Re-UE4SS/".insteadOf "https://github.com/Re-UE4SS/"
+        git config --global url."git@github.com:UE4SS-RE/".insteadOf "https://github.com/UE4SS-RE/"
+        git submodule update --init --recursive
+
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.0.2
+      uses: microsoft/setup-msbuild@v2
 
     - name: Build
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        mkdir build
-        cd build
-        cmake -G "Visual Studio 17 2022" ..
-        msbuild /p:Configuration=${{env.BUILD_CONFIGURATION}} .\StriveFrameData\StriveFrameData.sln
-        msbuild /p:Configuration=${{env.BUILD_CONFIGURATION}} .\RE-UE4SS\UE4SS\proxy_generator\proxy\proxy.sln
-    
-    - name: StandalonePackage
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        mkdir standalone\Mods\StriveFrameViewer\dlls
-        mkdir standalone\UE4SS_Signatures
-        cp .\build\StriveFrameData\${{env.BUILD_CONFIGURATION}}\StriveFrameData.dll .\standalone\Mods\StriveFrameViewer\dlls\main.dll
-        cp .\build\Output\${{env.BUILD_CONFIGURATION}}\proxy\bin\dwmapi.dll .\standalone\dwmapi.dll
-        cp .\build\Output\${{env.BUILD_CONFIGURATION}}\UE4SS\bin\UE4SS.dll .\standalone\UE4SS.dll
-        cp .\prereqs\mods.txt .\standalone\Mods\mods.txt
-        cp .\prereqs\UE4SS-settings.ini .\standalone\UE4SS-settings.ini
-        cp .\prereqs\FText_Constructor.lua .\standalone\UE4SS_Signatures\FText_Constructor.lua
+      shell: pwsh
+      run: .\Scripts\build_project.ps1
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v3.1.1
+    - name: Package
+      shell: pwsh
+      run: .\Scripts\package_standalone.ps1
+
+    - name: Upload package
+      uses: actions/upload-artifact@v4
       with:
-        name: StriveFrameViewer_Standalone
-        path: ${{github.workspace}}\standalone\
+        name: StriveOSC
+        path: ${{ github.workspace }}\Packages\Standalone\
         if-no-files-found: error
-
-    - name: UnverumPackage
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: |
-        mkdir unverum\ue4ss\StriveFrameViewer\dlls
-        cp .\build\StriveFrameData\${{env.BUILD_CONFIGURATION}}\StriveFrameData.dll .\unverum\ue4ss\StriveFrameViewer\dlls\main.dll
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v3.1.1
-      with:
-        name: StriveFrameViewer_Unverum
-        path: ${{github.workspace}}\unverum\
-        if-no-files-found: error
-
-
-        
-    
