@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     # Pinned image with Visual Studio 2022 (the CMake generator below needs it).
-    runs-on: windows-2025
+    runs-on: windows-2022
     steps:
     # UE4SS depends on a private repository (Re-UE4SS/UEPseudo) that only
     # GitHub accounts linked to Epic Games can read. The secret holds the
