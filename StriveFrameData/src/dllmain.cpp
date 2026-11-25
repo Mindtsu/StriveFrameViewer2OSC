@@ -174,6 +174,19 @@ struct HookStats {
   unsigned long reported = 0;    // ... that reached the reporter
 } g_stats;
 
+// Logs the registered move names when they change (new match, new character).
+void log_registered_moves_if_changed() {
+  static size_t last_count[2] = {0, 0};
+  for (int i = 0; i < 2; ++i) {
+    const auto names = registered_move_names(i);
+    if (names.empty() || names.size() == last_count[i]) continue;
+    last_count[i] = names.size();
+    std::string text = "P" + std::to_string(i + 1) + " registered moves (" + std::to_string(names.size()) + "):";
+    for (const auto &name : names) text += " " + name;
+    log_warning(text);
+  }
+}
+
 void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
   ++g_stats.calls;
   if (!g_mode.is_mode_allowed() || !g_reporter) {
@@ -197,6 +210,7 @@ void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
       ++g_stats.reported;
     }
     if (g_risc_finder) g_risc_finder->poll();
+    if ((g_config.log_moves || g_config.debug) && g_stats.calls % 60 == 0) log_registered_moves_if_changed();
   }
 
   if (g_config.debug && g_stats.calls % 300 == 0) {

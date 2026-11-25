@@ -26,12 +26,20 @@ namespace {
     out.state = bounded_string(player->get_BB_state(), 32);
     out.action_time = player->action_time;
 
-    // Move currently requested through the command interpreter.
-    out.skill_id = player->action_info_reg.skill_id;
+    // A move is reported when the character's current script state is one of
+    // the moves the game registered for it (m_SkillInfo): the game has then
+    // accepted the command. The pending-request field (action_info_reg) is
+    // consumed during the update, so it is already empty when read here.
+    out.skill_id = -1;
     out.skill_name.clear();
-    const long move_count = player->move_datas.move_count;
-    if (out.skill_id >= 0 && out.skill_id < move_count && out.skill_id < 180) {
-      out.skill_name = bounded_string(player->move_datas.moves[out.skill_id].get_name(), 20);
+    long move_count = player->move_datas.move_count;
+    if (move_count > 180) move_count = 180;
+    for (long i = 0; i < move_count; ++i) {
+      if (skill_name_matches_state(player->move_datas.moves[i].get_name(), 20, out.state)) {
+        out.skill_id = static_cast<int>(i);
+        out.skill_name = out.state;
+        break;
+      }
     }
 
     out.hp = player->hp;
@@ -45,6 +53,18 @@ namespace {
     else if (risc.source == MemoryRef::Source::Player) out.risc = read_int(player, risc.offset);
   }
 } // namespace
+
+std::vector<std::string> registered_move_names(int player_index) {
+  std::vector<std::string> names;
+  auto *engine = asw_engine::get();
+  if (!engine || player_index < 0 || player_index > 1) return names;
+  asw_player *player = engine->players[player_index].entity;
+  if (!player) return names;
+  long move_count = player->move_datas.move_count;
+  if (move_count > 180) move_count = 180;
+  for (long i = 0; i < move_count; ++i) names.push_back(bounded_string(player->move_datas.moves[i].get_name(), 20));
+  return names;
+}
 
 BattleEvents read_battle_events() {
   BattleEvents result;

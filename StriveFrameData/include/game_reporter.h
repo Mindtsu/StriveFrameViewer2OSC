@@ -8,15 +8,20 @@
 #include "osc_sender.h"
 
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <string>
+
+// True when the game's registered move name (m_SkillName, a char[capacity]
+// that cuts longer names) designates the given script state.
+bool skill_name_matches_state(const char *skill_name, size_t capacity, const std::string &state);
 
 struct PlayerSnapshot {
   bool valid = false;
   std::string state;       // current BBScript state, e.g. "NmlAtk5A", "CmnActFDash"
   int action_time = 0;     // frames spent in the current state
-  int skill_id = -1;       // registered move currently requested, -1 if none
-  std::string skill_name;  // its name (m_SkillName), empty if none
+  int skill_id = -1;       // index of the registered move the current state is, -1 if none
+  std::string skill_name;  // that move's name (the state name), empty if none
   int hp = 0;
   int tension_raw = 0;     // 0..10000
   int burst_raw = 0;       // 0..15000

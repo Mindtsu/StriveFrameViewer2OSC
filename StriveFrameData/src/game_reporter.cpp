@@ -3,6 +3,15 @@
 #include <algorithm>
 #include <utility>
 
+bool skill_name_matches_state(const char *skill_name, size_t capacity, const std::string &state) {
+  size_t length = 0;
+  while (length < capacity && skill_name[length] != '\0') ++length;
+  if (length == 0) return false;
+  if (length < capacity) return state.size() == length && state.compare(0, length, skill_name, length) == 0;
+  // Name filled the whole buffer: it was cut, compare the visible prefix.
+  return state.size() >= capacity && state.compare(0, capacity, skill_name, capacity) == 0;
+}
+
 GameReporter::GameReporter(const OscConfig &config, SendFn send, LogFn log)
     : config_(config), send_(std::move(send)), log_(std::move(log)) {}
 

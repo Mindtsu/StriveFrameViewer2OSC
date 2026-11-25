@@ -3,11 +3,18 @@
 #include "game_reporter.h"
 #include "osc_config.h"
 
+#include <string>
+#include <vector>
+
 struct BattleEvents {
   bool battle_start = false;
   bool round_end = false;
   bool rematch = false;
 };
+
+// Names of the moves the game registered for a player's character (0 or 1).
+// For diagnostics: it shows which script states count as moves.
+std::vector<std::string> registered_move_names(int player_index);
 
 // Reads the battle event queue. Call it BEFORE the original UpdateBattle,
 // like the original mod did, so the events of the previous update are seen.
