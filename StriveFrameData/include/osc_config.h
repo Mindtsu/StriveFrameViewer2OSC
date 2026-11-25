@@ -30,6 +30,8 @@ struct OscConfig {
   bool send_states = true;         // /pN/state on every script state change
   bool send_frame = false;         // /frame every battle frame
   bool log_moves = false;          // print moves in the UE4SS console
+  bool skip_rollback_frames = false; // ignore frames replayed by online rollback
+  bool debug = false;              // periodic counters in UE4SS.log
   int rounds_to_win = 2;           // to compute /pN/lives
 
   MemoryRef risc_p1;               // unset until found with the RISC finder

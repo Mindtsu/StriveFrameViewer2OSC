@@ -167,8 +167,17 @@ void hook_MatchStart(AREDGameState_Battle *game_state) {
   orig_MatchStart(game_state);
 }
 
+struct HookStats {
+  unsigned long calls = 0;       // UpdateBattle calls seen
+  unsigned long mode_off = 0;    // ... ignored because the game mode is not listed
+  unsigned long resim = 0;       // ... where the game reported a rollback replay
+  unsigned long reported = 0;    // ... that reached the reporter
+} g_stats;
+
 void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
+  ++g_stats.calls;
   if (!g_mode.is_mode_allowed() || !g_reporter) {
+    ++g_stats.mode_off;
     orig_UpdateBattle(game_state, delta_time);
     return;
   }
@@ -176,13 +185,24 @@ void hook_UpdateBattle(AREDGameState_Battle *game_state, float delta_time) {
   const BattleEvents events = read_battle_events();
   orig_UpdateBattle(game_state, delta_time);
 
-  // Online rollback replays frames; never report them twice.
-  if (is_resimulating()) return;
+  // Rollback only exists online. The two flags below are not proven to stay
+  // false in local play, so the frames are skipped only if asked for.
+  const bool resimulating = is_resimulating();
+  if (resimulating) ++g_stats.resim;
 
-  FrameSnapshot frame;
-  if (read_frame(g_config, events, frame)) g_reporter->on_frame(frame);
+  if (!(resimulating && g_config.skip_rollback_frames)) {
+    FrameSnapshot frame;
+    if (read_frame(g_config, events, frame)) {
+      g_reporter->on_frame(frame);
+      ++g_stats.reported;
+    }
+    if (g_risc_finder) g_risc_finder->poll();
+  }
 
-  if (g_risc_finder) g_risc_finder->poll();
+  if (g_config.debug && g_stats.calls % 300 == 0) {
+    log_warning("debug: hook calls=" + std::to_string(g_stats.calls) + " mode_off=" + std::to_string(g_stats.mode_off) +
+                " resim_flag=" + std::to_string(g_stats.resim) + " reported=" + std::to_string(g_stats.reported));
+  }
 }
 
 /* Mod Definition */

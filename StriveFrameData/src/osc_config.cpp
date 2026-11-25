@@ -116,6 +116,10 @@ void OscConfig::load_from_text(const std::string &text, std::vector<std::string>
       if (parse_bool(value, flag)) send_frame = flag; else bad();
     } else if (key == "log_moves") {
       if (parse_bool(value, flag)) log_moves = flag; else bad();
+    } else if (key == "skip_rollback_frames") {
+      if (parse_bool(value, flag)) skip_rollback_frames = flag; else bad();
+    } else if (key == "debug") {
+      if (parse_bool(value, flag)) debug = flag; else bad();
     } else if (key == "rounds_to_win") {
       if (parse_int(value, number) && number >= 1 && number <= 9) rounds_to_win = static_cast<int>(number);
       else bad();
@@ -142,6 +146,8 @@ const char *OscConfig::default_file_contents() {
          "send_states = 1\n"
          "send_frame = 0\n"
          "log_moves = 0\n"
+         "skip_rollback_frames = 0\n"
+         "debug = 0\n"
          "rounds_to_win = 2\n"
          "risc_p1 = none\n"
          "risc_p2 = none\n"

@@ -54,7 +54,8 @@ Le fichier `Mods/StriveOSC/osc_config.ini` est commenté. Les réglages principa
 
 - `port` et `prefix` : destination et préfixe OSC ;
 - `modes` : modes de jeu actifs. Par défaut `6,7,8` (Versus local et entraînement). Le numéro du mode courant est écrit dans `UE4SS.log` ;
-- `send_states`, `send_frame`, `log_moves`, `rounds_to_win`.
+- `send_states`, `send_frame`, `log_moves`, `rounds_to_win` ;
+- `skip_rollback_frames` : à garder à 0 en local, `debug` : compteurs dans `UE4SS.log`.
 
 Relancez le jeu après chaque modification.
 
